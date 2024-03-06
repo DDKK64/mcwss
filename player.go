@@ -1,27 +1,25 @@
 package mcwss
 
 import (
-	"crypto/ecdsa"
-	"crypto/x509"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
+	"reflect"
+	"sync"
+
 	"github.com/gorilla/websocket"
 	"github.com/sandertv/mcwss/mctype"
 	"github.com/sandertv/mcwss/protocol"
 	"github.com/sandertv/mcwss/protocol/command"
 	"github.com/sandertv/mcwss/protocol/event"
-	"github.com/yudai/gojsondiff"
-	"log"
-	"reflect"
-	"sync"
 )
 
 // Player is a player connected to the websocket server.
 type Player struct {
 	*websocket.Conn
-	encryptionSession *encryptionSession
-	debug             bool
+	// original encryption scheme is depracated
+	//encryptionSession *encryptionSession
+	debug bool
 
 	name      string
 	connected bool
@@ -36,6 +34,8 @@ type Player struct {
 
 	close       chan bool
 	packetStack chan interface{}
+	// requests that MC can handle are rate-limited.
+	limitQ chan struct{}
 }
 
 // NewPlayer returns an initialised player for a websocket connection.
@@ -46,11 +46,9 @@ func NewPlayer(conn *websocket.Conn) *Player {
 		handlers:         make(map[event.Name]func(event interface{})),
 		commandCallbacks: make(map[string]reflect.Value),
 		packetStack:      make(chan interface{}, 64),
+		limitQ:           make(chan struct{}, 100),
 		close:            make(chan bool, 1),
 	}
-	player.Exec(command.LocalPlayerNameRequest(), func(response *command.LocalPlayerName) {
-		player.name = response.LocalPlayerName
-	})
 	player.agent = NewAgent(player)
 	player.world = NewWorld(player)
 	go player.sendPackets()
@@ -102,12 +100,20 @@ func (player *Player) Position(f func(position mctype.Position)) {
 	})
 }
 
-// Rotation requests the Y-Rotation (yaw) of a player and calls the function passed when a response is 
+// Rotation requests the Y-Rotation (yaw) of a player and calls the function passed when a response is
 // received, containing the rotation of the player.
 func (player *Player) Rotation(f func(rotation float64)) {
 	player.Exec(command.QueryTargetRequest(mctype.Target(player.name)), func(response *command.QueryTarget) {
 		if len(*response.Details) == 1 {
 			f((*response.Details)[0].YRotation)
+		}
+	})
+}
+
+func (player *Player) LocationInfo(f func(loc *command.QueryResult)) {
+	player.Exec(command.QueryTargetRequest(mctype.Target(player.name)), func(response *command.QueryTarget) {
+		if len(*response.Details) == 1 {
+			f(&(*response.Details)[0])
 		}
 	})
 }
@@ -139,20 +145,44 @@ func (player *Player) Connected() bool {
 //
 // Nil may also be passed if no callback needs to be executed.
 func (player *Player) Exec(commandLine string, callback interface{}) {
-	commandLine = "/" + commandLine
-	val := reflect.ValueOf(callback)
-	if callback != nil {
-		t := val.Type()
+	player.exec(commandLine, callback, false)
+}
+
+// ExecWait is the blocking version of Exec
+func (player *Player) ExecWait(commandLine string, callback interface{}) {
+	player.exec(commandLine, callback, true)
+}
+
+func (player *Player) exec(commandLine string, callback interface{}, wait bool) {
+	if len(commandLine) == 0 || commandLine[0] != '/' {
+		commandLine = "/" + commandLine
+	}
+	fn := reflect.ValueOf(callback)
+	fnType := reflect.TypeOf(callback)
+	if callback != nil { // TODO: currently always true
 		// Do some basic function validation.
-		if t.Kind() != reflect.Func || t.NumIn() != 1 || (t.In(0).Kind() != reflect.Ptr && t.In(0).Kind() != reflect.Map) {
+		if fnType.Kind() != reflect.Func || fnType.NumIn() > 1 || (fnType.NumIn() == 1 && fnType.In(0).Kind() != reflect.Ptr && fnType.In(0).Kind() != reflect.Map) {
 			panic("invalid callback type passed. must be of type func(*commandResponse)")
 		}
 	}
+	var waitCh chan struct{}
+	registerFn := fn
+	if wait {
+		waitCh = make(chan struct{})
+		registerFn = reflect.MakeFunc(fnType, func(args []reflect.Value) (results []reflect.Value) {
+			results = fn.Call(args)
+			waitCh <- struct{}{}
+			return
+		})
+	}
 	packet := protocol.NewCommandRequest(commandLine)
 	player.Lock()
-	player.commandCallbacks[packet.Header.RequestID] = val
+	player.commandCallbacks[packet.Header.RequestID] = registerFn
 	player.Unlock()
-	_ = player.WriteJSON(packet)
+	player.EnqueeJSON(packet)
+	if waitCh != nil {
+		<-waitCh
+	}
 }
 
 // ExecAs sends a command string as if it were sent by the player itself with a callback that can process the
@@ -449,7 +479,7 @@ func (player *Player) UnsubscribeFrom(eventName event.Name) {
 
 // unsubscribeFrom unsubscribes from an event without locking.
 func (player *Player) unsubscribeFrom(eventName event.Name) {
-	_ = player.WriteJSON(protocol.NewEventRequest(eventName, protocol.Unsubscribe))
+	player.EnqueeJSON(protocol.NewEventRequest(eventName, protocol.Unsubscribe))
 	delete(player.handlers, eventName)
 }
 
@@ -459,14 +489,13 @@ func (player *Player) on(eventName event.Name, handler func(event interface{})) 
 	player.Lock()
 	player.handlers[eventName] = handler
 	player.Unlock()
-	_ = player.WriteJSON(protocol.NewEventRequest(eventName, protocol.Subscribe))
+	player.EnqueeJSON(protocol.NewEventRequest(eventName, protocol.Subscribe))
 }
 
-// WriteJSON adds a packet to the packet stack, after which will be written as JSON to the websocket
+// EnqueeJSON adds a packet to the packet stack, after which will be written as JSON to the websocket
 // connection.
-func (player *Player) WriteJSON(v interface{}) error {
+func (player *Player) EnqueeJSON(v interface{}) {
 	player.packetStack <- v
-	return nil
 }
 
 // sendPackets continuously sends packets to the websocket connection until the player is disconnected.
@@ -475,9 +504,7 @@ func (player *Player) sendPackets() {
 		select {
 		case packet := <-player.packetStack:
 			data, _ := json.Marshal(packet)
-			if player.encryptionSession != nil {
-				player.encryptionSession.encrypt(data)
-			}
+			player.limitQ <- struct{}{}
 			_ = player.Conn.WriteMessage(websocket.TextMessage, data)
 		case <-player.close:
 			return
@@ -486,127 +513,60 @@ func (player *Player) sendPackets() {
 }
 
 // handleIncomingPacket handles an incoming packet, processing in particular the body of the packet.
-func (player *Player) handleIncomingPacket(packet protocol.Packet) error {
-	switch body := packet.Body.(type) {
+func (player *Player) handleIncomingPacket(packet *protocol.Packet) error {
+	header := packet.Header
+	switch header.MessagePurpose {
 	default:
 		// Unknown or invalid packet. Don't try to process this.
-		return fmt.Errorf("unknown packet %v", reflect.TypeOf(body).Name())
-	case *protocol.ErrorResponse:
+		return fmt.Errorf("unknown message purpose %v. Payload: %v", packet.Header.MessagePurpose, packet)
+		//return fmt.Errorf("unknown packet: %v", packet)
+	case protocol.Error:
+		body := &protocol.ErrorResponse{}
+		_ = json.Unmarshal(packet.Body, body)
 		return fmt.Errorf("a client side error occurred (code = %v): %v", body.StatusCode, body.StatusMessage)
-	case *protocol.CommandResponse:
+	case protocol.Response:
+		<-player.limitQ
 		player.Lock()
-		callback, ok := player.commandCallbacks[packet.Header.RequestID]
+		callback, ok := player.commandCallbacks[header.RequestID]
 		// Remove the command callback from the map.
-		delete(player.commandCallbacks, packet.Header.RequestID)
+		delete(player.commandCallbacks, header.RequestID)
 		player.Unlock()
 		if !ok {
-			return fmt.Errorf("command response: got command response with unknown requestID %v", packet.Header.RequestID)
+			return fmt.Errorf("command response: got command response with unknown requestID %v", header.RequestID)
 		}
 
-		if callback.IsValid() {
-			commandResponseValue := reflect.New(callback.Type().In(0)).Interface()
-			if err := json.Unmarshal([]byte(*body), commandResponseValue); err != nil {
-				return fmt.Errorf("command response: malformed response JSON %v: %v", string(*body), err)
-			}
-			callback.Call([]reflect.Value{reflect.ValueOf(commandResponseValue).Elem()})
+		if !callback.IsValid() {
+			return fmt.Errorf("invalid callback")
 		}
-	case *protocol.EventResponse:
-		properties := event.Properties{}
-		if err := json.Unmarshal(body.Properties, &properties); err != nil {
-			return fmt.Errorf("event response: malformed properties JSON: %v", err)
-		}
-		// Update the player's properties to the latest.
-		player.Properties = properties
 
-		eventFunc, ok := event.Events[body.EventName]
+		//log.Println(string(packet.Body))
+		if callback.Type().NumIn() == 0 {
+			callback.Call(nil)
+			break
+		}
+		commandResponseValue := reflect.New(callback.Type().In(0)).Interface()
+		if err := json.Unmarshal(packet.Body, commandResponseValue); err != nil {
+			return fmt.Errorf("command response: malformed response JSON %v: %v", string(packet.Body), err)
+		}
+		callback.Call([]reflect.Value{reflect.ValueOf(commandResponseValue).Elem()})
+	case protocol.Event:
+
+		eventFunc, ok := event.Events[header.EventName]
 		if !ok {
-			return fmt.Errorf("event response: unknown event with name %v", body.EventName)
+			return fmt.Errorf("event response: unknown event with name %v", header.EventName)
 		}
 		eventData := eventFunc()
-		_ = json.Unmarshal(body.Properties, &eventData)
-
-		if measurable, ok := eventData.(event.Measurable); ok {
-			// Parse measurements if the event requires them.
-			measurable.ConsumeMeasurements(body.Measurements)
-		}
-
-		if player.debug {
-			foundData := map[string]interface{}{}
-			b, _ := json.Marshal(eventData)
-			_ = json.Unmarshal(b, &foundData)
-			b, _ = json.Marshal(properties)
-			_ = json.Unmarshal(b, &foundData)
-			b, _ = json.Marshal(foundData)
-
-			d := gojsondiff.New()
-			deltaDiff, err := d.Compare(b, body.Properties)
-			if err != nil {
-				log.Printf("error computing diff: %v", err)
-			}
-
-			actualData := map[string]interface{}{}
-			_ = json.Unmarshal(body.Properties, &actualData)
-
-			for _, change := range deltaDiff.Deltas() {
-				changeKey := fmt.Sprint(change)
-				var actualVal interface{}
-				if v, ok := actualData[changeKey]; ok {
-					actualVal = v
-				}
-				decVal, ok := foundData[changeKey]
-				if actualVal == nil && decVal != nil {
-					log.Printf("diff in %T.%v: should not exist", eventData, changeKey)
-				} else if ok {
-					log.Printf("diff in %T.%v: '%v' should be '%v'", eventData, changeKey, decVal, actualVal)
-				} else {
-					log.Printf("diff in %T.%v: should be '%v'", eventData, changeKey, actualVal)
-				}
-			}
-		}
+		_ = json.Unmarshal(packet.Body, &eventData)
 
 		// Find the handler by the event name.
 		player.Lock()
-		handler, ok := player.handlers[body.EventName]
+		handler, ok := player.handlers[header.EventName]
 		player.Unlock()
 		if !ok {
-			return fmt.Errorf("event response: unhandled event response for event %v", body.EventName)
+			return fmt.Errorf("event response: unhandled event response for event %v", header.EventName)
 		}
 		// Finally call the handler with the event data processed.
 		handler(eventData)
 	}
 	return nil
-}
-
-// enableEncryption enables encryption for a player using the server's private key passed and the server's
-// salt passed. The 'after' function passed is called after encryption was enabled.
-func (player *Player) enableEncryption(privateKey *ecdsa.PrivateKey, salt []byte, after func()) {
-	encodedKey, err := x509.MarshalPKIXPublicKey(&privateKey.PublicKey)
-	if err != nil {
-		// This should never happen.
-		panic(err)
-	}
-
-	player.Exec(command.EnableEncryptionRequest(encodedKey, salt), func(data *command.EnableEncryption) {
-		pubKeyData, err := base64.StdEncoding.DecodeString(data.PublicKey)
-		if err != nil {
-			log.Printf("error base64 decoding client public key %v: %v", data.PublicKey, err)
-			return
-		}
-		pubKey, err := x509.ParsePKIXPublicKey(pubKeyData)
-		if err != nil {
-			log.Printf("error parsing ecdsa public key %v: %v", data.PublicKey, err)
-			return
-		}
-
-		player.encryptionSession = &encryptionSession{
-			salt:             salt,
-			serverPrivateKey: privateKey,
-			clientPublicKey:  pubKey.(*ecdsa.PublicKey),
-		}
-		if err := player.encryptionSession.init(); err != nil {
-			log.Printf("error initialising encryption session: %v", err)
-			return
-		}
-		after()
-	})
 }

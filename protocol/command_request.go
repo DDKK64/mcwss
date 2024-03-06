@@ -1,6 +1,10 @@
 package protocol
 
-import "github.com/google/uuid"
+import (
+	"encoding/json"
+
+	"github.com/google/uuid"
+)
 
 // CommandRequest is used to send a raw command line to the client. The client itself will do the
 // processing of its arguments.
@@ -14,15 +18,16 @@ type CommandRequest struct {
 
 // NewCommandRequest returns a packet for a raw command to be executed.
 func NewCommandRequest(commandLine string) Packet {
+	body, _ := json.Marshal(&CommandRequest{
+		Version:     1,
+		CommandLine: commandLine,
+	})
 	return Packet{
 		Header: Header{
 			RequestID:      uuid.New().String(),
 			MessagePurpose: Command,
 			Version:        1,
 		},
-		Body: CommandRequest{
-			Version:     1,
-			CommandLine: commandLine,
-		},
+		Body: body,
 	}
 }

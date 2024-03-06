@@ -1,9 +1,10 @@
 package command
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
+	"strconv"
+
 	"github.com/sandertv/mcwss/mctype"
 )
 
@@ -24,11 +25,10 @@ type QueryTarget struct {
 	StatusMessage string `json:"statusMessage"`
 }
 
-// QueryResults is a slice with details for all targets matching the query.
-type QueryResults queryResults
+type QueryResults []QueryResult
 
 // queryResults is a slice with details for all targets matching the query.
-type queryResults []struct {
+type QueryResult struct {
 	// Dimension is the dimension the entity is currently in.
 	Dimension int `json:"dimension"`
 	// Position is the current position of the entity.
@@ -43,15 +43,14 @@ type queryResults []struct {
 // UnmarshalJSON unmarshals a data slice passed and implements the json.Unmarshaler. It is implemented to make
 // sure the details string is unmarshaled to an array properly.
 func (results *QueryResults) UnmarshalJSON(data []byte) error {
-	data = bytes.Replace(data, []byte{'\\', 'n'}, []byte{}, -1)
-	data = bytes.Replace(data, []byte{'\\'}, []byte{}, -1)
-	data = bytes.Replace(data, []byte{' '}, []byte{}, -1)
-
-	res := queryResults(*results)
-	if err := json.Unmarshal(bytes.Trim(data, `"`), &res); err != nil {
+	raw, err := strconv.Unquote(string(data))
+	if err != nil {
 		return err
 	}
 
-	*results = QueryResults(res)
+	t := (*[]QueryResult)(results)
+	if err := json.Unmarshal([]byte(raw), t); err != nil {
+		return err
+	}
 	return nil
 }

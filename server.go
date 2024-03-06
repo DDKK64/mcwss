@@ -5,10 +5,12 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/json"
-	"github.com/gorilla/websocket"
-	"github.com/sandertv/mcwss/protocol"
 	"log"
 	"net/http"
+
+	"github.com/gorilla/websocket"
+	"github.com/sandertv/mcwss/protocol"
+	"github.com/sandertv/mcwss/protocol/command"
 )
 
 // Server is the main entry-point of the mcwss package. It allows interfacing with clients connected to it and
@@ -17,7 +19,8 @@ type Server struct {
 	config   Config
 	upgrader websocket.Upgrader
 
-	players           map[*Player]bool
+	// multiplayer is buggy, disable it for now.
+	//players           map[*Player]bool
 	connectionFunc    func(conn *Player)
 	disconnectionFunc func(conn *Player)
 
@@ -39,13 +42,13 @@ func NewServer(config *Config) *Server {
 		panic(err)
 	}
 	server := &Server{
-		players:           make(map[*Player]bool),
 		config:            defaultConfig(),
 		connectionFunc:    func(conn *Player) {},
 		disconnectionFunc: func(conn *Player) {},
 		upgrader: websocket.Upgrader{
 			EnableCompression: true,
-			Subprotocols:      []string{MinecraftWSEncryptSubprotocol},
+			// This protocol seems depracated
+			//Subprotocols:      []string{MinecraftWSEncryptSubprotocol},
 		},
 		privateKey: privateKey,
 		salt:       salt,
@@ -80,6 +83,7 @@ func (server *Server) OnDisconnection(handler func(player *Player)) {
 // handleResponse handles the websocket response of a client connecting to the server. It first initialises
 // the websocket connection, after which it starts processing and sending packets.
 func (server *Server) handleResponse(writer http.ResponseWriter, request *http.Request) {
+	log.Println("Connection received")
 	ws, err := server.upgrader.Upgrade(writer, request, nil)
 	if err != nil {
 		log.Printf("error upgrading request: %v", err)
@@ -88,77 +92,53 @@ func (server *Server) handleResponse(writer http.ResponseWriter, request *http.R
 
 	// Initialise the player and add it to the players map.
 	player := NewPlayer(ws)
-	server.players[player] = true
 
-	defer func() {
-		// Unsubscribe from all events. The client keeps sending events to the websocket server, even after
-		// reconnecting. The client needs to either close the game, or we need to unsubscribe it from all
-		// events in order to stop receiving them the next session.
-		player.UnsubscribeFromAll()
+	go func() {
+		defer func() {
+			// Unsubscribe from all events. The client keeps sending events to the websocket server, even after
+			// reconnecting. The client needs to either close the game, or we need to unsubscribe it from all
+			// events in order to stop receiving them the next session.
+			player.UnsubscribeFromAll()
 
-		server.disconnectionFunc(player)
-		delete(server.players, player)
-		player.connected = false
+			server.disconnectionFunc(player)
+			player.connected = false
 
-		if err := ws.Close(); err != nil {
-			log.Panicf("error closing websocket connection: %v", err)
-		}
-		player.close <- true
-	}()
-
-	for {
-		nameBefore := player.name
-
-		msgType, payload, err := ws.ReadMessage()
-		if err != nil {
-			log.Printf("error reading message from connection: %v", err)
-			break
-		}
-		if msgType != websocket.TextMessage && msgType != websocket.BinaryMessage {
-			log.Printf("unexpected message type %v", msgType)
-			break
-		}
-		if player.encryptionSession != nil {
-			// Decrypt if the player's encryption session is established.
-			player.encryptionSession.decrypt(payload)
-		}
-
-		packet := &protocol.Packet{}
-		if err := json.Unmarshal(payload, packet); err != nil {
-			log.Printf("malformed packet JSON: %v", err)
-			break
-		}
-		// Find the correct body packet for the message purpose.
-		body, found := protocol.Packets[packet.Header.MessagePurpose]
-		if !found {
-			log.Printf("unknown message purpose %v", packet.Header.MessagePurpose)
-			break
-		}
-
-		// The packet.Body is currently a map because of some funny JSON behaviour. We marshal and unmarshal
-		// it into a pointer and set it back to have a pointer to a struct as body.
-		data, _ := json.Marshal(packet.Body)
-		cmdResponse, ok := body.(*protocol.CommandResponse)
-
-		if !ok {
-			if err := json.Unmarshal(data, &body); err != nil {
-				log.Printf("map to struct conversion failed: %v", err)
+			if err := ws.Close(); err != nil {
+				log.Panicf("error closing websocket connection: %v", err)
+			}
+			player.close <- true
+			log.Printf("player %s disconnected", player.name)
+		}()
+		for {
+			msgType, payload, err := ws.ReadMessage()
+			if err != nil {
+				log.Printf("error reading message from connection: %v", err)
 				break
 			}
-		} else {
-			*cmdResponse = protocol.CommandResponse(data)
-		}
-		packet.Body = body
+			if msgType != websocket.TextMessage && msgType != websocket.BinaryMessage {
+				log.Printf("unexpected message type %v", msgType)
+				break
+			}
 
-		if err := player.handleIncomingPacket(*packet); err != nil {
-			log.Printf("%v (payload: %v)", err, string(payload))
-			break
+			packet := &protocol.Packet{}
+			if err := json.Unmarshal(payload, packet); err != nil {
+				log.Printf("malformed JSON packet: %v", err)
+				break
+			}
+
+			if err := player.handleIncomingPacket(packet); err != nil {
+				log.Printf("%v (payload: %v)", err, string(payload))
+				continue
+			}
 		}
-		if nameBefore == "" {
-			player.enableEncryption(server.privateKey, server.salt, func() {
-				// Allow the creator of the server to interact with the new player.
-				server.connectionFunc(player)
-			})
-		}
+	}()
+
+	player.ExecWait(command.LocalPlayerNameRequest(), func(response *command.LocalPlayerName) {
+		player.name = response.LocalPlayerName
+	})
+
+	if player.name == "" {
+		log.Panic("No player name")
 	}
+	server.connectionFunc(player)
 }

@@ -1,7 +1,11 @@
 package protocol
 
+import "github.com/sandertv/mcwss/protocol/event"
+
 // Header describes the header of a packet. Each packet shares the same header.
 type Header struct {
+	// EventName is the name of the event, for example 'BlockPlaced'.
+	EventName event.Name `json:"eventName"`
 	// RequestID is a UUID specific to the request.
 	RequestID string `json:"requestId"`
 	// MessagePurpose is the purpose of the request. To subscribe to an event, this is 'subscribe'. To

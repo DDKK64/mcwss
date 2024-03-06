@@ -1,6 +1,8 @@
 package protocol
 
 import (
+	"encoding/json"
+
 	"github.com/google/uuid"
 	"github.com/sandertv/mcwss/protocol/event"
 )
@@ -14,14 +16,13 @@ type EventRequest struct {
 
 // NewEventRequest returns an event request for a particular event name and action.
 func NewEventRequest(eventName event.Name, purpose MessagePurpose) Packet {
+	body, _ := json.Marshal(&EventRequest{EventName: eventName})
 	return Packet{
 		Header: Header{
 			RequestID:      uuid.New().String(),
 			MessagePurpose: purpose,
 			Version:        1,
 		},
-		Body: EventRequest{
-			EventName: eventName,
-		},
+		Body: body,
 	}
 }
